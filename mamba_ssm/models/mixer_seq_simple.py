@@ -212,7 +212,7 @@ class MixerModel(nn.Module):
         return hidden_states
 
 
-class MambaLMHeadModel(nn.Module, GenerationMixin):
+class MambaLMHeadModel(nn.Module):
 
     def __init__(
         self,
@@ -233,8 +233,6 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         residual_in_fp32 = config.residual_in_fp32
         fused_add_norm = config.fused_add_norm
         pad_vocab_size_multiple = config.pad_vocab_size_multiple
-        factory_kwargs = {"device": device, "dtype": dtype}
-
         super().__init__()
         if vocab_size % pad_vocab_size_multiple != 0:
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
@@ -250,9 +248,10 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
-            **factory_kwargs,
+            device=device,
+            dtype=dtype
         )
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, device=device, dtype=dtype)
 
         # Initialize weights and apply final processing
         self.apply(
@@ -268,9 +267,6 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         if self.config.tie_embeddings:
             self.lm_head.weight = self.backbone.embedding.weight
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
-
     def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
@@ -284,10 +280,10 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         return CausalLMOutput(logits=lm_logits)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
+    def from_pretrained(cls, pretrained_model_name, initializer_cfg=None, device=None, dtype=None):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
-        model = cls(config, device=device, dtype=dtype, **kwargs)
+        model = cls(config, initializer_cfg=initializer_cfg, device=device, dtype=dtype)
         model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
         return model
 
