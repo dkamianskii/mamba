@@ -47,9 +47,22 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        ssm_cfg=None
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        d_state = ssm_cfg.get("d_state", 16)
+        d_conv = ssm_cfg.get("d_conv", 4)
+        expand = ssm_cfg.get("expand", 2)
+        dt_rank = ssm_cfg.get("dt_rank", "auto")
+        dt_min = ssm_cfg.get("dt_min", 0.001)
+        dt_max = ssm_cfg.get("dt_max", 0.1)
+        dt_init = ssm_cfg.get("dt_init", "random")
+        dt_scale = ssm_cfg.get("dt_scale", 1.0)
+        dt_init_floor = ssm_cfg.get("dt_init_floor", 1e-4)
+        conv_bias = ssm_cfg.get("conv_bias", True)
+        bias = ssm_cfg.get("bias", False)
+        use_fast_path = ssm_cfg.get("use_fast_path", True)
+
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -59,7 +72,7 @@ class Mamba(nn.Module):
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, device=device, dtype=dtype)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
@@ -68,16 +81,16 @@ class Mamba(nn.Module):
             kernel_size=d_conv,
             groups=self.d_inner,
             padding=d_conv - 1,
-            **factory_kwargs,
+            device=device, dtype=dtype,
         )
 
         self.activation = "silu"
         self.act = nn.SiLU()
 
         self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, device=device, dtype=dtype
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, device=device, dtype=dtype)
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
@@ -90,7 +103,7 @@ class Mamba(nn.Module):
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.d_inner, device=device, dtype=dtype) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
@@ -114,9 +127,9 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
         self.D._no_weight_decay = True
 
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, device=device, dtype=dtype)
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, inference_params=None, mixer_args=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -252,7 +265,7 @@ class Mamba(nn.Module):
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
         conv_state = torch.zeros(

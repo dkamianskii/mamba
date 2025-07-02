@@ -56,11 +56,12 @@ def create_block(
         mixer_cls = partial(
             Mamba2 if ssm_layer == "Mamba2" else Mamba,
             layer_idx=layer_idx,
-            **ssm_cfg,
-            **factory_kwargs
+            device=device,
+            dtype=dtype,
+            ssm_cfg=ssm_cfg
         )
     else:
-        mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, **factory_kwargs)
+        mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, device=device, dtype=dtype)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -68,7 +69,7 @@ def create_block(
         mlp_cls = nn.Identity
     else:
         mlp_cls = partial(
-            GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory_kwargs
+            GatedMLP, hidden_features=d_intermediate, out_features=d_model, device=device, dtype=dtype
         )
     block = Block(
         d_model,
@@ -133,11 +134,12 @@ class MixerModel(nn.Module):
         device=None,
         dtype=None,
     ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
+        if initializer_cfg is None:
+            initializer_cfg = {}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
 
-        self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+        self.embedding = nn.Embedding(vocab_size, d_model, device=device, dtype=dtype)
 
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:
@@ -162,37 +164,39 @@ class MixerModel(nn.Module):
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
                     layer_idx=i,
-                    **factory_kwargs,
+                    device=device,
+                    dtype=dtype
                 )
                 for i in range(n_layer)
             ]
         )
 
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
-            d_model, eps=norm_epsilon, **factory_kwargs
+            d_model, eps=norm_epsilon, device=device, dtype=dtype
         )
 
         self.apply(
             partial(
                 _init_weights,
                 n_layer=n_layer,
-                **(initializer_cfg if initializer_cfg is not None else {}),
+                initializer_range=initializer_cfg.get("initializer_range", 0.02),
+                rescale_prenorm_residual=initializer_cfg.get("rescale_prenorm_residual", True),
                 n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
             )
         )
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
-            for i, layer in enumerate(self.layers)
-        }
+    # def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    #     return {
+    #         i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+    #         for i, layer in enumerate(self.layers)
+    #     }
 
-    def forward(self, input_ids, inference_params=None, **mixer_kwargs):
+    def forward(self, input_ids, inference_params=None, mixer_args=None):
         hidden_states = self.embedding(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
+                hidden_states, residual, inference_params=inference_params, mixer_args=mixer_args
             )
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
@@ -267,12 +271,12 @@ class MambaLMHeadModel(nn.Module):
         if self.config.tie_embeddings:
             self.lm_head.weight = self.backbone.embedding.weight
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
+    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, mixer_args=None):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
+        hidden_states = self.backbone(input_ids, inference_params=inference_params, mixer_args=mixer_args)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)

@@ -63,9 +63,33 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         sequence_parallel=True,
         device=None,
         dtype=None,
+        ssm_cfg=None
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        d_state = ssm_cfg.get("d_state", 128)
+        d_conv = ssm_cfg.get("d_conv", 4)
+        conv_init = ssm_cfg.get("conv_init", None)
+        expand = ssm_cfg.get("expand", 2)
+        headdim = ssm_cfg.get("headdim", 64)
+        d_ssm = ssm_cfg.get("d_ssm", None)
+        # If not None, we only apply SSM on this many dimensions, the rest uses gated MLP
+        ngroups = ssm_cfg.get("ngroups", 1)
+        A_init_range = ssm_cfg.get("A_init_range", (1, 16))
+        D_has_hdim = ssm_cfg.get("D_has_hdim", False)
+        rmsnorm = ssm_cfg.get("rmsnorm", True)
+        norm_before_gate = ssm_cfg.get("norm_before_gate", False)
+        dt_min = ssm_cfg.get("dt_min", 0.001)
+        dt_max = ssm_cfg.get("dt_max", 0.1)
+        dt_init_floor = ssm_cfg.get("dt_init_floor", 1e-4)
+        dt_limit = ssm_cfg.get("dt_limit", (0.0, float("inf")))
+        bias = ssm_cfg.get("bias", False)
+        conv_bias = ssm_cfg.get("conv_bias", True)
+        # Fused kernel and sharding options
+        chunk_size = ssm_cfg.get("chunk_size", 256)
+        use_mem_eff_path = ssm_cfg.get("use_mem_eff_path", True)
+        process_group = ssm_cfg.get("process_group", None)
+        sequence_parallel = ssm_cfg.get("sequence_parallel", None)
+
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -95,11 +119,11 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         if self.process_group is None:
-            self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+            self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, device=device, dtype=dtype)
         else:
             self.in_proj = ColumnParallelLinear(self.d_model, d_in_proj * self.world_size, bias=bias,
                                                 process_group=self.process_group, sequence_parallel=self.sequence_parallel,
-                                                **factory_kwargs)
+                                                device=device, dtype=dtype)
 
         conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
         self.conv1d = nn.Conv1d(
@@ -109,7 +133,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             kernel_size=d_conv,
             groups=conv_dim,
             padding=d_conv - 1,
-            **factory_kwargs,
+            device=device,
+            dtype=dtype
         )
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -118,7 +143,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         # Initialize log dt bias
         dt = torch.exp(
-            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.nheads, device=device, dtype=dtype) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
@@ -142,16 +167,16 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if self.rmsnorm:
             assert RMSNormGated is not None
             self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
-                                     group_size=self.d_ssm // ngroups, **factory_kwargs)
+                                     group_size=self.d_ssm // ngroups, device=device, dtype=dtype)
 
         if self.process_group is None:
-            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, device=device, dtype=dtype)
         else:
             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
-                                              **factory_kwargs)
+                                              device=device, dtype=dtype)
 
-    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+    def forward(self, u, mixer_args=None, inference_params=None):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
@@ -159,6 +184,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             (in case batch is small).
         Returns: same shape as u
         """
+        if mixer_args is None:
+            seqlen, seq_idx, cu_seqlens = None, None, None
+        else:
+            seqlen = mixer_args.get("seqlen", None)
+            seq_idx = mixer_args.get("seq_idx", None)
+            cu_seqlens = mixer_args.get("cu_seqlens", None)
+
         seqlen_og = seqlen
         if seqlen is None:
             batch, seqlen, dim = u.shape
@@ -342,7 +374,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
         conv_state = torch.zeros(
