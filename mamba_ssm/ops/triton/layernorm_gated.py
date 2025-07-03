@@ -5,6 +5,7 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 import math
+import typing
 
 import torch
 import torch.nn.functional as F
@@ -14,8 +15,10 @@ import triton.language as tl
 
 from einops import rearrange
 
+from typing import Optional
 
-def rms_norm_ref(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, upcast=True):
+
+def rms_norm_ref(x, weight, bias, z=None, eps=1e-6, group_size: Optional[int]=None, norm_before_gate=True, upcast=True):
     dtype = x.dtype
     N = x.shape[-1]
     weight = weight.float()
@@ -105,7 +108,7 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y, mask=mask)
 
 
-def _layer_norm_fwd(x, weight, bias, eps, z=None, out=None, group_size=None, norm_before_gate=True, is_rms_norm=False):
+def _layer_norm_fwd(x, weight, bias, eps, z=None, out=None, group_size: Optional[int]=None, norm_before_gate=True, is_rms_norm=False):
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -268,7 +271,7 @@ def _layer_norm_bwd_kernel(
         tl.store(DB + row_block_id * stride_db_row + group * N + cols, db, mask=mask)
 
 
-def _layer_norm_bwd(dy, x, weight, bias, eps, mean, rstd, z=None, group_size=None,
+def _layer_norm_bwd(dy, x, weight, bias, eps, mean, rstd, z=None, group_size: Optional[int]=None,
                     norm_before_gate=True, is_rms_norm=False, recompute_output=False, dz=None, out=None):
     M, N = x.shape
     if group_size is None:
@@ -338,7 +341,7 @@ def _layer_norm_bwd(dy, x, weight, bias, eps, mean, rstd, z=None, group_size=Non
 class LayerNormFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True,
+    def forward(ctx, x, weight, bias, z=None, eps=1e-6, group_size: Optional[int]=None, norm_before_gate=True,
                 is_rms_norm=False):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))
         """
@@ -381,13 +384,13 @@ def layernorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before
     return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm)
 
 
-def rmsnorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True):
+def rmsnorm_fn(x, weight, bias: typing.Optional[torch.nn.Parameter], z=None, eps: float=1e-6, group_size: Optional[int]=None, norm_before_gate: bool=True):
     return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True)
 
 
 class LayerNorm(torch.nn.Module):
 
-    def __init__(self, hidden_size, eps=1e-5, group_size=None, norm_before_gate=True, device=None, dtype=None):
+    def __init__(self, hidden_size, eps=1e-5, group_size: Optional[int]=None, norm_before_gate=True, device=None, dtype=None):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
         """
@@ -414,7 +417,7 @@ class LayerNorm(torch.nn.Module):
 
 class RMSNorm(torch.nn.Module):
 
-    def __init__(self, hidden_size, eps=1e-5, group_size=None, norm_before_gate=True, device=None, dtype=None):
+    def __init__(self, hidden_size, eps=1e-5, group_size: Optional[int]=None, norm_before_gate=True, device=None, dtype=None):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
         """

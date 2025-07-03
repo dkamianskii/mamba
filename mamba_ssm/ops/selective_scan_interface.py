@@ -87,8 +87,8 @@ def rms_norm_forward(
     x,
     weight,
     bias,
-    eps=1e-6,
-    is_rms_norm=True,
+    eps: float = 1e-6,
+    is_rms_norm: bool = True,
 ):
     # x (b l) d
     if x.stride(-1) != 1:

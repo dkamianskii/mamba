@@ -1,6 +1,7 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 import math
+from typing import Optional, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -63,7 +64,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         sequence_parallel=True,
         device=None,
         dtype=None,
-        ssm_cfg=None
+        ssm_cfg: Optional[dict]=None
     ):
         super().__init__()
         d_state = ssm_cfg.get("d_state", 128)
@@ -176,7 +177,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               device=device, dtype=dtype)
 
-    def forward(self, u, mixer_args=None, inference_params=None):
+    def forward(self, u, mixer_args: Optional[Dict[str, Any]] = None, inference_params=None):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
@@ -187,9 +188,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if mixer_args is None:
             seqlen, seq_idx, cu_seqlens = None, None, None
         else:
-            seqlen = mixer_args.get("seqlen", None)
-            seq_idx = mixer_args.get("seq_idx", None)
-            cu_seqlens = mixer_args.get("cu_seqlens", None)
+            seqlen: Optional[int] = mixer_args.get("seqlen", None)
+            seq_idx: Optional[int] = mixer_args.get("seq_idx", None)
+            cu_seqlens: Optional[int] = mixer_args.get("cu_seqlens", None)
 
         seqlen_og = seqlen
         if seqlen is None:
@@ -212,7 +213,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
-        dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+        # dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
@@ -231,7 +232,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 headdim=None if self.D_has_hdim else self.headdim,
                 ngroups=self.ngroups,
                 norm_before_gate=self.norm_before_gate,
-                **dt_limit_kwargs,
+                dt_limit=self.dt_limit,
             )
             if seqlen_og is not None:
                 out = rearrange(out, "b l d -> (b l) d")
@@ -286,7 +287,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 dt_softplus=True,
                 seq_idx=seq_idx,
                 cu_seqlens=cu_seqlens,
-                **dt_limit_kwargs,
+                dt_limit=self.dt_limit,
                 return_final_states=ssm_state is not None,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
             )

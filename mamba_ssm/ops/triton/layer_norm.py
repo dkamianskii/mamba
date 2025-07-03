@@ -8,6 +8,7 @@
 
 import math
 import warnings
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -918,19 +919,19 @@ def layer_norm_fn(
 
 
 def rms_norm_fn(
-    x,
-    weight,
-    bias,
-    residual=None,
-    x1=None,
-    weight1=None,
-    bias1=None,
-    eps=1e-6,
-    dropout_p=0.0,
-    rowscale=None,
-    prenorm=False,
-    residual_in_fp32=False,
-    return_dropout_mask=False,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor] = None,
+    x1: Optional[torch.Tensor] = None,
+    weight1: Optional[torch.Tensor] = None,
+    bias1: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    dropout_p: float = 0.0,
+    rowscale: Optional[torch.Tensor] = None,
+    prenorm: bool = False,
+    residual_in_fp32: bool = False,
+    return_dropout_mask: bool = False
 ):
     return LayerNormFn.apply(
         x,
@@ -967,7 +968,7 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
+    def forward(self, x, residual=None, prenorm: bool =False, residual_in_fp32: bool=False):
         return rms_norm_fn(
             x,
             self.weight,
