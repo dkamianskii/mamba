@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.models.config_mamba import MambaGeneralConfig
 
 
 batch = 10
@@ -10,7 +10,7 @@ seqlen = 64
 device = "cpu"
 dtype = torch.float32
 
-config = MambaConfig(
+config = MambaGeneralConfig(
     d_model=512,
     n_layer=4,
     vocab_size=256,

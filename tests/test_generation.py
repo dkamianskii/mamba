@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.models.config_mamba import MambaGeneralConfig
 from mamba_ssm.utils.generation import InferenceParams
 
 
@@ -15,7 +15,7 @@ def test_generation():
     device = "cuda"
     dtype = torch.float16
 
-    config = MambaConfig(
+    config = MambaGeneralConfig(
         d_model=1024,
         n_layer=4,
         vocab_size=50277,
@@ -49,7 +49,7 @@ def test_generation_varlen():
     device = "cuda"
     dtype = torch.float16
 
-    config = MambaConfig(
+    config = MambaGeneralConfig(
         d_model=1024,
         n_layer=4,
         vocab_size=50277,

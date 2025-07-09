@@ -10,6 +10,7 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
+from mamba_ssm.models.config_mamba import Mamba1Config, MixerArgs
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 
 try:
@@ -32,55 +33,30 @@ class Mamba(nn.Module):
     def __init__(
         self,
         d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        conv_bias=True,
-        bias=False,
-        use_fast_path=True,  # Fused kernel options
-        layer_idx=None,
-        device=None,
-        dtype=None,
-        ssm_cfg=None
+        mamba_cfg: Mamba1Config,
+        layer_idx: int,
+        device: str,
+        dtype: torch.dtype,
     ):
         super().__init__()
-        d_state = ssm_cfg.get("d_state", 16)
-        d_conv = ssm_cfg.get("d_conv", 4)
-        expand = ssm_cfg.get("expand", 2)
-        dt_rank = ssm_cfg.get("dt_rank", "auto")
-        dt_min = ssm_cfg.get("dt_min", 0.001)
-        dt_max = ssm_cfg.get("dt_max", 0.1)
-        dt_init = ssm_cfg.get("dt_init", "random")
-        dt_scale = ssm_cfg.get("dt_scale", 1.0)
-        dt_init_floor = ssm_cfg.get("dt_init_floor", 1e-4)
-        conv_bias = ssm_cfg.get("conv_bias", True)
-        bias = ssm_cfg.get("bias", False)
-        use_fast_path = ssm_cfg.get("use_fast_path", True)
 
         self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
+        self.d_state = mamba_cfg.d_state
+        self.d_conv = mamba_cfg.d_conv
+        self.d_inner = int(mamba_cfg.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if mamba_cfg.dt_rank == "auto" else mamba_cfg.dt_rank
+        self.use_fast_path = mamba_cfg.use_fast_path
         self.layer_idx = layer_idx
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, device=device, dtype=dtype)
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=mamba_cfg.bias, device=device, dtype=dtype)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
+            bias=mamba_cfg.conv_bias,
+            kernel_size=mamba_cfg.d_conv,
             groups=self.d_inner,
-            padding=d_conv - 1,
+            padding=mamba_cfg.d_conv - 1,
             device=device, dtype=dtype,
         )
 
@@ -93,19 +69,19 @@ class Mamba(nn.Module):
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, device=device, dtype=dtype)
 
         # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = self.dt_rank**-0.5 * dt_scale
-        if dt_init == "constant":
+        dt_init_std = self.dt_rank**-0.5 * mamba_cfg.dt_scale
+        if mamba_cfg.dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
+        elif mamba_cfg.dt_init == "random":
             nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
         else:
             raise NotImplementedError
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, device=device, dtype=dtype) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
+            torch.rand(self.d_inner, device=device, dtype=dtype) * (math.log(mamba_cfg.dt_max) - math.log(mamba_cfg.dt_min))
+            + math.log(mamba_cfg.dt_min)
+        ).clamp(min=mamba_cfg.dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
@@ -127,9 +103,9 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
         self.D._no_weight_decay = True
 
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, device=device, dtype=dtype)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=mamba_cfg.bias, device=device, dtype=dtype)
 
-    def forward(self, hidden_states, inference_params=None, mixer_args=None):
+    def forward(self, hidden_states, inference_params=None, mixer_args: Optional[MixerArgs]=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -269,29 +245,28 @@ class Mamba(nn.Module):
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
         conv_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype
+            batch_size, self.d_inner, self.d_conv, device=device, dtype=conv_dtype
         )
         ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
         # ssm_dtype = torch.float32
         ssm_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype
+            batch_size, self.d_inner, self.d_state, device=device, dtype=ssm_dtype
         )
         return conv_state, ssm_state
 
     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
-        assert self.layer_idx is not None
         if self.layer_idx not in inference_params.key_value_memory_dict:
             batch_shape = (batch_size,)
             conv_state = torch.zeros(
                 batch_size,
-                self.d_model * self.expand,
+                self.d_inner,
                 self.d_conv,
                 device=self.conv1d.weight.device,
                 dtype=self.conv1d.weight.dtype,
             )
             ssm_state = torch.zeros(
                 batch_size,
-                self.d_model * self.expand,
+                self.d_inner,
                 self.d_state,
                 device=self.dt_proj.weight.device,
                 dtype=self.dt_proj.weight.dtype,
